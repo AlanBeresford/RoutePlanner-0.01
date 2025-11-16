@@ -1,0 +1,481 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <title>OSM Routenoptimierung</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+
+  <!-- Leaflet CSS -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+
+  <!-- jsPDF für PDF-Export -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+
+  <style>
+    body {
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      margin: 0;
+      display: flex;
+      height: 100vh;
+      background: #f5f5f5;
+      color: #222;
+    }
+
+    .sidebar {
+      width: 480px;
+      padding: 1rem;
+      box-sizing: border-box;
+      border-right: 1px solid #ccc;
+      overflow-y: auto;
+      background: #ffffff;
+    }
+
+    #map {
+      flex: 1;
+      width: 100%;
+      height: 100%;
+      min-height: 600px;
+    }
+
+    textarea {
+      width: 100%;
+      min-height: 220px;
+      box-sizing: border-box;
+      resize: vertical;
+      background: #fafafa;
+      color: #222;
+      border: 1px solid #ccc;
+      border-radius: 4px;
+      padding: 0.5rem;
+    }
+
+    button {
+      padding: 0.5rem 1rem;
+      cursor: pointer;
+      margin-top: 0.5rem;
+      margin-right: 0.5rem;
+      border-radius: 4px;
+      border: 1px solid #bbb;
+      background: #e7e7e7;
+      color: #222;
+    }
+
+    button:disabled {
+      opacity: 0.5;
+      cursor: default;
+    }
+
+    button:hover:not(:disabled) {
+      background: #d7d7d7;
+    }
+
+    .result {
+      margin-top: 1rem;
+      font-size: 0.9rem;
+    }
+
+    ol {
+      padding-left: 1.2rem;
+    }
+
+    .start-info {
+      font-size: 0.9rem;
+      padding: 0.5rem;
+      background: #eef5ff;
+      border-radius: 4px;
+      margin-bottom: 0.5rem;
+      border: 1px solid #ccd8ff;
+    }
+
+    .file-row {
+      margin: 0.5rem 0;
+      font-size: 0.9rem;
+    }
+
+    code {
+      background: #f0f0f0;
+      padding: 2px 4px;
+      border-radius: 3px;
+    }
+
+    .number-icon div {
+      font-weight: bold;
+    }
+
+    .duplicates-list {
+      color: #d58512;
+    }
+
+    .invalid-list {
+      color: #c9302c;
+    }
+
+    .solver-info {
+      font-size: 0.8rem;
+      color: #555;
+      margin-top: 0.3rem;
+    }
+  </style>
+</head>
+<body>
+
+  <div class="sidebar">
+    <h2>OSM Routenoptimierer</h2>
+
+    <div class="start-info">
+      <strong>Start & Ziel (fest):</strong><br>
+      {{ start_address }}
+    </div>
+
+    <p><strong>Stopps eingeben:</strong><br>
+      Jede Ziel-Adresse in eine <u>eigene Zeile</u> schreiben – ohne Startadresse.<br>
+      Beispiel:<br>
+      <code>Martin-Andersen-Nexö-Ring 12, 18106 Rostock</code><br>
+      <code>Maxim-Gorki-Straße 36, 18106 Rostock</code>
+    </p>
+
+    <textarea id="addresses" placeholder="Ziel-Adresse 1&#10;Ziel-Adresse 2&#10;..."></textarea>
+
+    <div class="file-row">
+      <label for="fileInput"><strong>Adressen importieren:</strong></label><br>
+      <input type="file" id="fileInput" accept=".txt,.csv">
+      <div><small>Die Inhalte der Datei werden ins Textfeld übernommen.</small></div>
+    </div>
+
+    <button id="optimizeBtn">Route optimieren</button>
+    <button id="saveCsvBtn" disabled>Tour als CSV speichern</button>
+    <button id="savePdfBtn" disabled>Tour als PDF exportieren</button>
+
+    <div id="status" class="result"></div>
+    <div id="stats" class="result"></div>
+    <div id="solverInfo" class="solver-info"></div>
+    <div id="duplicates" class="result"></div>
+    <div id="invalid" class="result"></div>
+    <div id="orderedList" class="result"></div>
+  </div>
+
+  <div id="map"></div>
+
+  <!-- Leaflet JS -->
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+  <script>
+    let currentTourData = null;
+
+    // Nummerierte Icons: Start/Ziel in GRÜN, Stopps in BLAU
+    function startIcon(number) {
+      return L.divIcon({
+        html: `
+          <div style="
+            background:#00aa55;
+            color:white;
+            width:32px;
+            height:32px;
+            line-height:32px;
+            text-align:center;
+            border-radius:50%;
+            font-weight:bold;
+            font-size:15px;
+            border:2px solid white;
+            box-shadow:0 0 4px rgba(0,0,0,0.8);
+          ">${number}</div>`,
+        className: "number-icon",
+        iconSize: [32, 32],
+        iconAnchor: [16, 32]
+      });
+    }
+
+    function stopIcon(number) {
+      return L.divIcon({
+        html: `
+          <div style="
+            background:#0078ff;
+            color:white;
+            width:32px;
+            height:32px;
+            line-height:32px;
+            text-align:center;
+            border-radius:50%;
+            font-weight:bold;
+            font-size:15px;
+            border:2px solid white;
+            box-shadow:0 0 4px rgba(0,0,0,0.8);
+          ">${number}</div>`,
+        className: "number-icon",
+        iconSize: [32, 32],
+        iconAnchor: [16, 32]
+      });
+    }
+
+    // Helle, moderne Karte: CartoDB Positron
+    var map = L.map('map').setView([54.1, 12.1], 11); // Rostock
+
+    L.tileLayer(
+      'https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png',
+      {
+        maxZoom: 19,
+        attribution: '&copy; OpenStreetMap-Mitwirkende, &copy; CARTO'
+      }
+    ).addTo(map);
+
+    var routeLayer = null;
+    var markersLayer = L.layerGroup().addTo(map);
+
+    // Datei-Import
+    var fileInput = document.getElementById('fileInput');
+    var textarea = document.getElementById('addresses');
+
+    fileInput.addEventListener('change', function () {
+      var file = fileInput.files[0];
+      if (!file) return;
+
+      var reader = new FileReader();
+      reader.onload = function (e) {
+        var content = e.target.result;
+        var current = textarea.value.trim();
+        textarea.value = current ? (current + "\n" + content.trim()) : content.trim();
+      };
+      reader.readAsText(file, 'utf-8');
+    });
+
+    // Route optimieren
+    document.getElementById('optimizeBtn').addEventListener('click', function () {
+      var addresses = textarea.value;
+      var status = document.getElementById('status');
+      var stats = document.getElementById('stats');
+      var listDiv = document.getElementById('orderedList');
+      var duplicatesDiv = document.getElementById('duplicates');
+      var invalidDiv = document.getElementById('invalid');
+      var solverInfo = document.getElementById('solverInfo');
+      var saveCsvBtn = document.getElementById('saveCsvBtn');
+      var savePdfBtn = document.getElementById('savePdfBtn');
+
+      status.textContent = "Berechne Route...";
+      stats.textContent = "";
+      listDiv.textContent = "";
+      duplicatesDiv.textContent = "";
+      invalidDiv.textContent = "";
+      solverInfo.textContent = "";
+      saveCsvBtn.disabled = true;
+      savePdfBtn.disabled = true;
+      currentTourData = null;
+
+      fetch('/optimize', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ addresses: addresses })
+      })
+      .then(res => res.json().then(data => ({ ok: res.ok, data })))
+      .then(obj => {
+        if (!obj.ok) {
+          status.textContent = "Fehler: " + (obj.data.error || "Unbekannter Fehler");
+          if (obj.data.invalid_addresses) {
+            var invHtml = "<strong>Ungültige/ nicht gefundene Adressen:</strong><ul class=\"invalid-list\">";
+            obj.data.invalid_addresses.forEach(function (d) {
+              invHtml += "<li>" + d + "</li>";
+            });
+            invHtml += "</ul>";
+            invalidDiv.innerHTML = invHtml;
+          }
+          return;
+        }
+
+        var data = obj.data;
+        currentTourData = data;
+        saveCsvBtn.disabled = false;
+        savePdfBtn.disabled = false;
+
+        status.textContent = "Route erfolgreich berechnet.";
+
+        stats.innerHTML =
+          "<strong>Gesamt:</strong> " +
+          data.total_distance_km + " km, " +
+          data.total_duration_min + " Minuten";
+
+        // Solver-Info
+        if (data.solver === "ortools") {
+          solverInfo.textContent = "Optimierer: OR-Tools (echte TSP-Optimierung)";
+        } else {
+          solverInfo.textContent = "Optimierer: Greedy (Fallback)";
+        }
+
+        // Dubletten anzeigen
+        if (data.duplicates && data.duplicates.length > 0) {
+          var dupHtml = "<strong>Entfernte Dubletten:</strong><ul class=\"duplicates-list\">";
+          data.duplicates.forEach(function (d) {
+            dupHtml += "<li>" + d + "</li>";
+          });
+          dupHtml += "</ul>";
+          duplicatesDiv.innerHTML = dupHtml;
+        }
+
+        // Ungültige Adressen anzeigen
+        if (data.invalid_addresses && data.invalid_addresses.length > 0) {
+          var invHtml = "<strong>Ungültige/ nicht gefundene Adressen:</strong><ul class=\"invalid-list\">";
+          data.invalid_addresses.forEach(function (d) {
+            invHtml += "<li>" + d + "</li>";
+          });
+          invHtml += "</ul>";
+          invalidDiv.innerHTML = invHtml;
+        }
+
+        // Liste anzeigen
+        var html = "<h3>Optimierte Reihenfolge</h3><ol>";
+        data.ordered_stops.forEach(function (stop) {
+          if (stop.is_start) {
+            html += "<li><strong>(Start/Ziel)</strong> " + stop.address + "</li>";
+          } else {
+            html += "<li>" + stop.address + "</li>";
+          }
+        });
+        html += "</ol>";
+        listDiv.innerHTML = html;
+
+        // Karte aktualisieren
+        markersLayer.clearLayers();
+        if (routeLayer) {
+          map.removeLayer(routeLayer);
+        }
+
+        // Route zeichnen
+        var geojson = data.route_geojson;
+        routeLayer = L.geoJSON(geojson).addTo(map);
+        map.fitBounds(routeLayer.getBounds(), { padding: [20, 20] });
+
+        // Marker setzen
+        data.ordered_stops.forEach(function (stop) {
+          var label = stop.sequence + ". ";
+          if (stop.is_start) {
+            label += "(Start/Ziel) ";
+          }
+          label += stop.address;
+
+          var icon = stop.is_start ? startIcon(stop.sequence) : stopIcon(stop.sequence);
+
+          var marker = L.marker(
+            [stop.lat, stop.lon],
+            { icon: icon }
+          ).bindPopup(label);
+
+          markersLayer.addLayer(marker);
+        });
+
+      })
+      .catch(err => {
+        console.error(err);
+        status.textContent = "Fehler bei der Anfrage.";
+      });
+    });
+
+    // CSV-Export
+    document.getElementById('saveCsvBtn').addEventListener('click', function () {
+      if (!currentTourData) {
+        alert("Es ist keine Tour geladen.");
+        return;
+      }
+
+      var lines = [];
+      lines.push("Reihenfolge;Typ;Adresse;Lat;Lon");
+
+      currentTourData.ordered_stops.forEach(function (stop) {
+        var typ = stop.is_start ? "Start/Ziel" : "Stopp";
+        var line = [
+          stop.sequence,
+          typ,
+          '"' + stop.address.replace(/"/g, '""') + '"',
+          stop.lat,
+          stop.lon
+        ].join(";");
+        lines.push(line);
+      });
+
+      var csvContent = lines.join("\r\n");
+      var blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
+
+      var now = new Date();
+      var timestamp = now.toISOString().slice(0,19).replace(/[:T]/g, "-");
+      var fileName = "tour_" + timestamp + ".csv";
+
+      if (navigator.msSaveBlob) {
+        navigator.msSaveBlob(blob, fileName);
+      } else {
+        var link = document.createElement("a");
+        if (link.download !== undefined) {
+          var url = URL.createObjectURL(blob);
+          link.setAttribute("href", url);
+          link.setAttribute("download", fileName);
+          link.style.visibility = "hidden";
+          document.body.appendChild(link);
+          link.click();
+          document.body.removeChild(link);
+        }
+      }
+    });
+
+    // PDF-Export
+    document.getElementById('savePdfBtn').addEventListener('click', function () {
+      if (!currentTourData) {
+        alert("Es ist keine Tour geladen.");
+        return;
+      }
+
+      const { jsPDF } = window.jspdf;
+      const doc = new jsPDF({ unit: "mm", format: "a4" });
+
+      let y = 15;
+      doc.setFontSize(16);
+      doc.text("Tourplan", 10, y);
+      y += 8;
+
+      doc.setFontSize(11);
+      var dateStr = new Date().toLocaleString();
+      doc.text("Erstellt am: " + dateStr, 10, y);
+      y += 6;
+
+      doc.text("Start/Ziel: " + currentTourData.start_address, 10, y);
+      y += 6;
+
+      doc.text(
+        "Gesamt: " +
+        currentTourData.total_distance_km + " km, " +
+        currentTourData.total_duration_min + " Minuten",
+        10, y
+      );
+      y += 8;
+
+      if (currentTourData.solver === "ortools") {
+        doc.text("Optimierer: OR-Tools (TSP)", 10, y);
+      } else {
+        doc.text("Optimierer: Greedy (Fallback)", 10, y);
+      }
+      y += 8;
+
+      doc.setFontSize(12);
+      doc.text("Stopps:", 10, y);
+      y += 6;
+      doc.setFontSize(10);
+
+      currentTourData.ordered_stops.forEach(function (stop) {
+        var typ = stop.is_start ? "Start/Ziel" : "Stopp";
+        var line = stop.sequence + ". [" + typ + "] " + stop.address;
+
+        // Bei Bedarf auf neue Seite springen
+        if (y > 280) {
+          doc.addPage();
+          y = 15;
+        }
+
+        var splitted = doc.splitTextToSize(line, 180);
+        doc.text(splitted, 10, y);
+        y += 5 + (splitted.length - 1) * 4;
+      });
+
+      var now = new Date();
+      var timestamp = now.toISOString().slice(0,19).replace(/[:T]/g, "-");
+      var fileName = "tour_" + timestamp + ".pdf";
+      doc.save(fileName);
+    });
+  </script>
+
+</body>
+</html>
