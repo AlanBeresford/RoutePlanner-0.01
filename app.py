@@ -277,16 +277,22 @@ def optimize():
     coords = [(start_lat, start_lon)] + coords_user
     geocoded_addresses = [START_ADDRESS] + valid_addresses
 
-    # OSRM-Matrix abrufen
+        # OSRM-Matrix abrufen
     try:
         distances, durations = get_osrm_table(coords)
     except Exception as e:
         return jsonify({"error": f"Fehler bei der OSRM-Matrix: {e}"}), 500
 
-    # Reihenfolge berechnen: erst versuchen wir OR-Tools, sonst Greedy
+    # Anzahl Punkte (Start/Ziel + Stopps)
+    n_points = len(coords)
+
+    # Reihenfolge berechnen:
+    # - Bis zu 24 Stopps (n_points <= 25) -> OR-Tools (TSP)
+    # - Darüber -> direkt Greedy-Fallback, damit es stabil bleibt
     solver_used = "greedy"
     order = None
-    if HAS_OR_TOOLS:
+
+    if HAS_OR_TOOLS and n_points <= 25:
         order = ortools_tsp(distances, roundtrip=True)
         if order is not None:
             solver_used = "ortools"
@@ -335,3 +341,4 @@ def optimize():
 
 if __name__ == "__main__":
     app.run(debug=True)
+
