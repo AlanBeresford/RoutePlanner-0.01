@@ -20,6 +20,10 @@ NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 # Öffentlicher OSRM-Routingserver
 OSRM_BASE_URL = "https://router.project-osrm.org"
 
+# Fester Start-/Endpunkt (Depot)
+START_ADDRESS = "Aleksis-Kivi-Straße 1, 18106 Rostock, Deutschland"
+START_COORD = None  # wird beim ersten Aufruf ermittelt und gecached
+
 
 def normalize_address_string(address: str) -> str:
     """
@@ -47,7 +51,7 @@ def geocode_address(address):
         "limit": 1
     }
     headers = {
-        "User-Agent": f"Routenoptimierer/1.0 ({CONTACT_EMAIL})"
+        "User-Agent": f"UwesRoutenplaner/1.0 ({CONTACT_EMAIL})"
     }
 
     # 1. Versuch: Originaladresse
@@ -74,6 +78,14 @@ def geocode_address(address):
     lat = float(data[0]["lat"])
     lon = float(data[0]["lon"])
     return lat, lon
+
+
+def ensure_start_coord():
+    """Startkoordinaten einmal holen und dann cachen."""
+    global START_COORD
+    if START_COORD is None:
+        START_COORD = geocode_address(START_ADDRESS)
+    return START_COORD
 
 
 def get_osrm_table(coords):
@@ -138,7 +150,6 @@ def ortools_tsp(distance_matrix, roundtrip=True):
     if n <= 1:
         return [0]
 
-    # Datenmodell für OR-Tools
     data = {}
     data["distance_matrix"] = [
         [int(d if d is not None else 0) for d in row] for row in distance_matrix
@@ -161,7 +172,6 @@ def ortools_tsp(distance_matrix, roundtrip=True):
     transit_callback_index = routing.RegisterTransitCallback(distance_callback)
     routing.SetArcCostEvaluatorOfAllVehicles(transit_callback_index)
 
-    # Suchstrategie
     search_parameters = pywrapcp.DefaultRoutingSearchParameters()
     search_parameters.first_solution_strategy = (
         routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
@@ -176,7 +186,6 @@ def ortools_tsp(distance_matrix, roundtrip=True):
     if solution is None:
         return None
 
-    # Route extrahieren
     index = routing.Start(0)
     route = []
     while not routing.IsEnd(index):
@@ -200,7 +209,7 @@ def get_osrm_route(coords, order):
 
     url = f"{OSRM_BASE_URL}/route/v1/driving/{coord_str}"
     params = {
-        "overview": "full",
+        "overview": "full",  # ggf. "simplified" für kleinere GeoJSONs
         "geometries": "geojson"
     }
 
@@ -216,184 +225,154 @@ def get_osrm_route(coords, order):
 
 @app.route("/")
 def index():
-    return render_template("index.html")
+    return render_template("index.html", start_address=START_ADDRESS)
 
 
 @app.route("/optimize", methods=["POST"])
 def optimize():
+    data = request.get_json() or {}
+    addresses_raw = data.get("addresses", "")
+    fixed_start_raw = (data.get("fixed_start") or "").strip()
+
+    # Ziel-Adressen Zeile für Zeile (Rohliste)
+    raw_addresses = [a.strip() for a in addresses_raw.split("\n") if a.strip()]
+
+    if len(raw_addresses) < 1:
+        return jsonify({"error": "Bitte mindestens eine Ziel-Adresse eingeben."}), 400
+
+    # Dubletten erkennen & entfernen (Case-insensitive)
+    seen = set()
+    user_addresses = []
+    duplicates = []
+
+    for addr in raw_addresses:
+        key = addr.strip().lower()
+        if key in seen:
+            duplicates.append(addr)
+        else:
+            seen.add(key)
+            user_addresses.append(addr)
+
+    if len(user_addresses) < 1:
+        return jsonify({"error": "Nach Entfernen der Dubletten blieb keine Adresse übrig."}), 400
+
+    # Startpunkt holen
     try:
-        data = request.get_json() or {}
+        start_lat, start_lon = ensure_start_coord()
+    except Exception as e:
+        return jsonify({"error": f"Fehler beim Startpunkt-Geocoding: {e}"}), 500
 
-        depot_raw = (data.get("depot") or "").strip()
-        addresses_raw = data.get("addresses", "")
-        fixed_start_raw = (data.get("fixed_start") or "").strip()
-        fixed_end_raw = (data.get("fixed_end") or "").strip()
+    # Zielkoordinaten holen mit Adressprüfung
+    coords_user = []
+    valid_addresses = []
+    invalid_addresses = []
 
-        if not depot_raw:
-            return jsonify({"error": "Bitte eine Depot-Adresse angeben."}), 400
-
-        # Ziel-Adressen Zeile für Zeile (Rohliste)
-        raw_addresses = [a.strip() for a in addresses_raw.split("\n") if a.strip()]
-
-        if len(raw_addresses) < 1:
-            return jsonify({"error": "Bitte mindestens eine Ziel-Adresse eingeben."}), 400
-
-        # Dubletten erkennen & entfernen (Case-insensitive)
-        seen = set()
-        user_addresses = []
-        duplicates = []
-
-        for addr in raw_addresses:
-            key = addr.strip().lower()
-            if key in seen:
-                duplicates.append(addr)
-            else:
-                seen.add(key)
-                user_addresses.append(addr)
-
-        if len(user_addresses) < 1:
-            return jsonify({"error": "Nach Entfernen der Dubletten blieb keine Adresse übrig."}), 400
-
-        # Depot (Start/Ziel) geocodieren
+    for addr in user_addresses:
         try:
-            start_lat, start_lon = geocode_address(depot_raw)
-        except Exception as e:
-            return jsonify({"error": f"Fehler beim Depot-Geocoding: {e}"}), 400
+            lat, lon = geocode_address(addr)
+            coords_user.append((lat, lon))
+            valid_addresses.append(addr)
+        except Exception:
+            invalid_addresses.append(addr)
 
-        # Zielkoordinaten holen mit Adressprüfung
-        coords_user = []
-        valid_addresses = []
-        invalid_addresses = []
-
-        for addr in user_addresses:
-            try:
-                lat, lon = geocode_address(addr)
-                coords_user.append((lat, lon))
-                valid_addresses.append(addr)
-            except Exception:
-                invalid_addresses.append(addr)
-
-        if len(coords_user) == 0:
-            return jsonify({
-                "error": "Keine gültigen Ziel-Adressen gefunden.",
-                "invalid_addresses": invalid_addresses
-            }), 400
-
-        # Gesamtliste (Index 0 = Depot)
-        coords = [(start_lat, start_lon)] + coords_user
-        geocoded_addresses = [depot_raw] + valid_addresses
-
-        # OSRM-Matrix abrufen
-        try:
-            distances, durations = get_osrm_table(coords)
-        except Exception as e:
-            return jsonify({"error": f"Fehler bei der OSRM-Matrix: {e}"}), 500
-
-        # Anzahl Punkte (Depot + Stopps)
-        n_points = len(coords)
-
-        # Reihenfolge berechnen:
-        # - Bis zu 25 Punkte -> OR-Tools (TSP)
-        # - Darüber -> direkt Greedy-Fallback, damit es stabil bleibt
-        solver_used = "greedy"
-        order = None
-
-        if HAS_OR_TOOLS and n_points <= 25:
-            order = ortools_tsp(distances, roundtrip=True)
-            if order is not None:
-                solver_used = "ortools"
-
-        if order is None:
-            order = greedy_tsp(distances, roundtrip=True)
-
-        # Falls aus irgendeinem Grund nichts Sinnvolles herauskommt
-        if not order or len(order) < 2:
-            return jsonify({"error": "Konnte keine sinnvolle Reihenfolge berechnen."}), 500
-
-        # Feste Start-/End-Stopps per Adressmatch bestimmen
-        norm_map = {norm_for_match(addr): idx for idx, addr in enumerate(geocoded_addresses)}
-        fixed_start_idx = None
-        fixed_end_idx = None
-
-        if fixed_start_raw:
-            fixed_start_idx = norm_map.get(norm_for_match(fixed_start_raw))
-            if fixed_start_idx == 0:
-                fixed_start_idx = None
-
-        if fixed_end_raw:
-            fixed_end_idx = norm_map.get(norm_for_match(fixed_end_raw))
-            if fixed_end_idx == 0:
-                fixed_end_idx = None
-
-        if fixed_start_idx is not None and fixed_start_idx == fixed_end_idx:
-            fixed_end_idx = None
-
-        # Sicherstellen, dass Depot (0) am Anfang und Ende steht
-        if 0 not in order:
-            order.insert(0, 0)
-        if order[0] != 0:
-            order.remove(0)
-            order.insert(0, 0)
-        if order[-1] != 0:
-            if 0 in order:
-                order.remove(0)
-            order.append(0)
-
-        # Fester erster Kunden-Stopp (direkt nach Depot)
-        if fixed_start_idx is not None and fixed_start_idx in order:
-            order = [i for i in order if i != fixed_start_idx]
-            order.insert(1, fixed_start_idx)
-
-        # Fester letzter Kunden-Stopp (direkt vor Depot)
-        if fixed_end_idx is not None and fixed_end_idx in order:
-            order = [i for i in order if i != fixed_end_idx]
-            order.insert(len(order) - 1, fixed_end_idx)
-
-        # Distanz & Zeit summieren (None-Werte ignorieren)
-        total_distance = 0.0
-        total_duration = 0.0
-
-        for i in range(len(order) - 1):
-            a = order[i]
-            b = order[i + 1]
-            d_dist = distances[a][b]
-            d_dur = durations[a][b]
-            if d_dist is None or d_dur is None:
-                continue
-            total_distance += d_dist
-            total_duration += d_dur
-
-        # OSRM-Route holen
-        try:
-            route = get_osrm_route(coords, order)
-        except Exception as e:
-            return jsonify({"error": f"Fehler bei der Routenberechnung: {e}"}), 500
-
-        # Ausgabe formatieren
-        ordered_list = []
-        for idx, i in enumerate(order):
-            ordered_list.append({
-                "sequence": idx + 1,
-                "address": geocoded_addresses[i],
-                "lat": coords[i][0],
-                "lon": coords[i][1],
-                "is_start": (i == 0)
-            })
-
+    if len(coords_user) == 0:
         return jsonify({
-            "start_address": depot_raw,
-            "ordered_stops": ordered_list,
-            "total_distance_km": round(total_distance / 1000.0, 2),
-            "total_duration_min": round(total_duration / 60.0, 1),
-            "route_geojson": route["geometry"],
-            "duplicates": duplicates,
-            "invalid_addresses": invalid_addresses,
-            "solver": solver_used
+            "error": "Keine gültigen Adressen gefunden.",
+            "invalid_addresses": invalid_addresses
+        }), 400
+
+    # Gesamtliste (Index 0 = Start/Ziel)
+    coords = [(start_lat, start_lon)] + coords_user
+    geocoded_addresses = [START_ADDRESS] + valid_addresses
+
+    # OSRM-Matrix abrufen
+    try:
+        distances, durations = get_osrm_table(coords)
+    except Exception as e:
+        return jsonify({"error": f"Fehler bei der OSRM-Matrix: {e}"}), 500
+
+    n_points = len(coords)
+
+    # Reihenfolge berechnen:
+    # - Bis zu 25 Punkte -> OR-Tools (TSP)
+    # - Darüber -> Greedy-Fallback
+    solver_used = "greedy"
+    order = None
+
+    if HAS_OR_TOOLS and n_points <= 25:
+        order = ortools_tsp(distances, roundtrip=True)
+        if order is not None:
+            solver_used = "ortools"
+
+    if order is None:
+        order = greedy_tsp(distances, roundtrip=True)
+
+    # Fester erster Kunden-Stopp:
+    # -> Muss in geocoded_addresses vorkommen (Index != 0)
+    fixed_start_idx = None
+    if fixed_start_raw:
+        norm_map = {norm_for_match(addr): idx
+                    for idx, addr in enumerate(geocoded_addresses)}
+        fixed_start_idx = norm_map.get(norm_for_match(fixed_start_raw))
+        if fixed_start_idx == 0:
+            fixed_start_idx = None  # Depot darf nicht als fester Kundenstopp gelten
+
+    # Sicherstellen, dass Depot (0) am Anfang und Ende steht
+    if 0 not in order:
+        order.insert(0, 0)
+    if order[0] != 0:
+        if 0 in order:
+            order.remove(0)
+        order.insert(0, 0)
+    if order[-1] != 0:
+        if 0 in order:
+            order.remove(0)
+        order.append(0)
+
+    # Fester erster Kunden-Stopp direkt nach Depot
+    if fixed_start_idx is not None and fixed_start_idx in order:
+        # aus aktueller Position entfernen
+        order = [i for i in order if i != fixed_start_idx]
+        # direkt nach Depot einfügen
+        order.insert(1, fixed_start_idx)
+
+    # Distanz & Zeit summieren
+    total_distance = 0
+    total_duration = 0
+
+    for i in range(len(order) - 1):
+        a = order[i]
+        b = order[i + 1]
+        total_distance += distances[a][b]
+        total_duration += durations[a][b]
+
+    # OSRM-Route holen
+    try:
+        route = get_osrm_route(coords, order)
+    except Exception as e:
+        return jsonify({"error": f"Fehler bei der Routenberechnung: {e}"}), 500
+
+    # Ausgabe formatieren
+    ordered_list = []
+    for idx, i in enumerate(order):
+        ordered_list.append({
+            "sequence": idx + 1,
+            "address": geocoded_addresses[i],
+            "lat": coords[i][0],
+            "lon": coords[i][1],
+            "is_start": (i == 0)
         })
 
-    except Exception as e:
-        # Fallback: Immer JSON-Fehler zurückgeben
-        return jsonify({"error": f"Unerwarteter Fehler im Server: {e}"}), 500
+    return jsonify({
+        "start_address": START_ADDRESS,
+        "ordered_stops": ordered_list,
+        "total_distance_km": round(total_distance / 1000, 2),
+        "total_duration_min": round(total_duration / 60, 1),
+        "route_geojson": route["geometry"],
+        "duplicates": duplicates,
+        "invalid_addresses": invalid_addresses,
+        "solver": solver_used
+    })
 
 
 if __name__ == "__main__":
