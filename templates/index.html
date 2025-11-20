@@ -1,379 +1,501 @@
-from flask import Flask, render_template, request, jsonify
-import requests
-import re
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <title>OSM Routenoptimierung</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
 
-# Optional: OR-Tools für echte TSP-Optimierung
-try:
-    from ortools.constraint_solver import pywrapcp, routing_enums_pb2
-    HAS_OR_TOOLS = True
-except ImportError:
-    HAS_OR_TOOLS = False
+  <!-- Leaflet CSS -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
 
-app = Flask(__name__)
+  <!-- jsPDF für PDF-Export -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
 
-# Kontaktinfo für Nominatim (Pflicht laut Nutzungsbedingungen)
-CONTACT_EMAIL = "maxmontana@hotmail.de"
-
-# OpenStreetMap Nominatim Geocoding
-NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
-
-# Öffentlicher OSRM-Routingserver
-OSRM_BASE_URL = "https://router.project-osrm.org"
-
-# Fester Start-/Endpunkt (Depot)
-START_ADDRESS = "Aleksis-Kivi-Straße 1, 18106 Rostock, Deutschland"
-START_COORD = None  # wird beim ersten Aufruf ermittelt und gecached
-
-
-def normalize_address_string(address: str) -> str:
-    """
-    Einfache Normalisierung für häufige Schreibweisen:
-    - str. / str -> straße
-    - strasse -> straße
-    """
-    a = address
-    a = re.sub(r'\bstr\.\b', 'straße', a, flags=re.IGNORECASE)
-    a = re.sub(r'\bstr\b', 'straße', a, flags=re.IGNORECASE)
-    a = re.sub(r'strasse', 'straße', a, flags=re.IGNORECASE)
-    return a
-
-
-def norm_for_match(s: str) -> str:
-    """Normalisierung für Adressvergleiche (Case-insensitive, Leerzeichen vereinheitlichen)."""
-    return re.sub(r'\s+', ' ', normalize_address_string(s).strip().lower())
-
-
-def geocode_address(address):
-    """Adresse -> (lat, lon) via Nominatim, mit einfacher Fuzzy-Normalisierung."""
-    params = {
-        "q": address,
-        "format": "json",
-        "limit": 1
-    }
-    headers = {
-        "User-Agent": f"UwesRoutenplaner/1.0 ({CONTACT_EMAIL})"
+  <style>
+    body {
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      margin: 0;
+      display: flex;
+      height: 100vh;
+      background: #f5f5f5;
+      color: #222;
     }
 
-    # 1. Versuch: Originaladresse
-    r = requests.get(NOMINATIM_URL, params=params, headers=headers, timeout=10)
-    if r.status_code == 429:
-        raise ValueError("Nominatim: Zu viele Anfragen (429). Bitte kurz warten.")
-    r.raise_for_status()
-    data = r.json()
-
-    # Wenn nichts gefunden, mit normalisierter Adresse versuchen
-    if not data:
-        normalized = normalize_address_string(address)
-        if normalized.lower() != address.lower():
-            params["q"] = normalized
-            r2 = requests.get(NOMINATIM_URL, params=params, headers=headers, timeout=10)
-            if r2.status_code == 429:
-                raise ValueError("Nominatim: Zu viele Anfragen (429). Bitte kurz warten.")
-            r2.raise_for_status()
-            data = r2.json()
-
-    if not data:
-        raise ValueError(f"Keine Geodaten für Adresse: {address}")
-
-    lat = float(data[0]["lat"])
-    lon = float(data[0]["lon"])
-    return lat, lon
-
-
-def ensure_start_coord():
-    """Startkoordinaten einmal holen und dann cachen."""
-    global START_COORD
-    if START_COORD is None:
-        START_COORD = geocode_address(START_ADDRESS)
-    return START_COORD
-
-
-def get_osrm_table(coords):
-    """Matrix (Zeit & Distanz) von OSRM holen."""
-    if len(coords) < 2:
-        raise ValueError("Mindestens zwei Koordinaten erforderlich.")
-
-    coord_str = ";".join([f"{lon},{lat}" for lat, lon in coords])
-    url = f"{OSRM_BASE_URL}/table/v1/driving/{coord_str}"
-    params = {"annotations": "duration,distance"}
-
-    r = requests.get(url, params=params, timeout=20)
-    r.raise_for_status()
-    data = r.json()
-
-    if "durations" not in data or "distances" not in data:
-        raise ValueError("OSRM-Table-Antwort unvollständig.")
-
-    return data["distances"], data["durations"]
-
-
-def greedy_tsp(distance_matrix, roundtrip=True):
-    """Fallback: einfacher Greedy-Algorithmus für TSP-Lösung."""
-    n = len(distance_matrix)
-    if n == 0:
-        return []
-
-    visited = [False] * n
-    path = [0]
-    visited[0] = True
-
-    for _ in range(n - 1):
-        last = path[-1]
-        next_idx = None
-        best_dist = float("inf")
-
-        for j in range(n):
-            if not visited[j]:
-                d = distance_matrix[last][j]
-                if d is not None and d < best_dist:
-                    best_dist = d
-                    next_idx = j
-
-        if next_idx is None:
-            break
-
-        visited[next_idx] = True
-        path.append(next_idx)
-
-    if roundtrip and path[0] != path[-1]:
-        path.append(0)
-
-    return path
-
-
-def ortools_tsp(distance_matrix, roundtrip=True):
-    """Echte TSP-Optimierung mit OR-Tools."""
-    if not HAS_OR_TOOLS:
-        return None
-
-    n = len(distance_matrix)
-    if n <= 1:
-        return [0]
-
-    data = {}
-    data["distance_matrix"] = [
-        [int(d if d is not None else 0) for d in row] for row in distance_matrix
-    ]
-    data["num_vehicles"] = 1
-    data["depot"] = 0
-
-    manager = pywrapcp.RoutingIndexManager(
-        len(data["distance_matrix"]),
-        data["num_vehicles"],
-        data["depot"]
-    )
-    routing = pywrapcp.RoutingModel(manager)
-
-    def distance_callback(from_index, to_index):
-        from_node = manager.IndexToNode(from_index)
-        to_node = manager.IndexToNode(to_index)
-        return data["distance_matrix"][from_node][to_node]
-
-    transit_callback_index = routing.RegisterTransitCallback(distance_callback)
-    routing.SetArcCostEvaluatorOfAllVehicles(transit_callback_index)
-
-    search_parameters = pywrapcp.DefaultRoutingSearchParameters()
-    search_parameters.first_solution_strategy = (
-        routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
-    )
-    search_parameters.local_search_metaheuristic = (
-        routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
-    )
-    search_parameters.time_limit.FromSeconds(5)
-
-    solution = routing.SolveWithParameters(search_parameters)
-
-    if solution is None:
-        return None
-
-    index = routing.Start(0)
-    route = []
-    while not routing.IsEnd(index):
-        node = manager.IndexToNode(index)
-        route.append(node)
-        index = solution.Value(routing.NextVar(index))
-
-    if roundtrip:
-        if route[0] != 0:
-            route.insert(0, 0)
-        if route[-1] != 0:
-            route.append(0)
-
-    return route
-
-
-def get_osrm_route(coords, order):
-    """Route-Geometrie für die berechnete Reihenfolge holen."""
-    ordered_coords = [coords[i] for i in order]
-    coord_str = ";".join([f"{lon},{lat}" for lat, lon in ordered_coords])
-
-    url = f"{OSRM_BASE_URL}/route/v1/driving/{coord_str}"
-    params = {
-        "overview": "full",  # ggf. "simplified" für kleinere GeoJSONs
-        "geometries": "geojson"
+    .sidebar {
+      width: 480px;
+      padding: 1rem;
+      box-sizing: border-box;
+      border-right: 1px solid #ccc;
+      overflow-y: auto;
+      background: #ffffff;
     }
 
-    r = requests.get(url, params=params, timeout=25)
-    r.raise_for_status()
-    data = r.json()
+    #map {
+      flex: 1;
+      width: 100%;
+      height: 100%;
+      min-height: 600px;
+    }
 
-    if "routes" not in data or not data["routes"]:
-        raise ValueError("OSRM-Route-Antwort enthält keine Route.")
+    textarea {
+      width: 100%;
+      min-height: 220px;
+      box-sizing: border-box;
+      resize: vertical;
+      background: #fafafa;
+      color: #222;
+      border: 1px solid #ccc;
+      border-radius: 4px;
+      padding: 0.5rem;
+    }
 
-    return data["routes"][0]
+    input[type="text"] {
+      width: 100%;
+      box-sizing: border-box;
+      padding: 0.35rem 0.4rem;
+      border-radius: 4px;
+      border: 1px solid #ccc;
+      margin-top: 0.25rem;
+      background: #fafafa;
+    }
 
+    button {
+      padding: 0.5rem 1rem;
+      cursor: pointer;
+      margin-top: 0.5rem;
+      margin-right: 0.5rem;
+      border-radius: 4px;
+      border: 1px solid #bbb;
+      background: #e7e7e7;
+      color: #222;
+    }
 
-@app.route("/")
-def index():
-    return render_template("index.html", start_address=START_ADDRESS)
+    button:disabled {
+      opacity: 0.5;
+      cursor: default;
+    }
 
+    button:hover:not(:disabled) {
+      background: #d7d7d7;
+    }
 
-@app.route("/optimize", methods=["POST"])
-def optimize():
-    data = request.get_json() or {}
-    addresses_raw = data.get("addresses", "")
-    fixed_start_raw = (data.get("fixed_start") or "").strip()
+    .result {
+      margin-top: 1rem;
+      font-size: 0.9rem;
+    }
 
-    # Ziel-Adressen Zeile für Zeile (Rohliste)
-    raw_addresses = [a.strip() for a in addresses_raw.split("\n") if a.strip()]
+    ol {
+      padding-left: 1.2rem;
+    }
 
-    if len(raw_addresses) < 1:
-        return jsonify({"error": "Bitte mindestens eine Ziel-Adresse eingeben."}), 400
+    .start-info {
+      font-size: 0.9rem;
+      padding: 0.5rem;
+      background: #eef5ff;
+      border-radius: 4px;
+      margin-bottom: 0.5rem;
+      border: 1px solid #ccd8ff;
+    }
 
-    # Dubletten erkennen & entfernen (Case-insensitive)
-    seen = set()
-    user_addresses = []
-    duplicates = []
+    .file-row {
+      margin: 0.5rem 0;
+      font-size: 0.9rem;
+    }
 
-    for addr in raw_addresses:
-        key = addr.strip().lower()
-        if key in seen:
-            duplicates.append(addr)
-        else:
-            seen.add(key)
-            user_addresses.append(addr)
+    code {
+      background: #f0f0f0;
+      padding: 2px 4px;
+      border-radius: 3px;
+    }
 
-    if len(user_addresses) < 1:
-        return jsonify({"error": "Nach Entfernen der Dubletten blieb keine Adresse übrig."}), 400
+    .number-icon div {
+      font-weight: bold;
+    }
 
-    # Startpunkt holen
-    try:
-        start_lat, start_lon = ensure_start_coord()
-    except Exception as e:
-        return jsonify({"error": f"Fehler beim Startpunkt-Geocoding: {e}"}), 500
+    .duplicates-list {
+      color: #d58512;
+    }
 
-    # Zielkoordinaten holen mit Adressprüfung
-    coords_user = []
-    valid_addresses = []
-    invalid_addresses = []
+    .invalid-list {
+      color: #c9302c;
+    }
 
-    for addr in user_addresses:
-        try:
-            lat, lon = geocode_address(addr)
-            coords_user.append((lat, lon))
-            valid_addresses.append(addr)
-        except Exception:
-            invalid_addresses.append(addr)
+    .solver-info {
+      font-size: 0.8rem;
+      color: #555;
+      margin-top: 0.3rem;
+    }
+  </style>
+</head>
+<body>
 
-    if len(coords_user) == 0:
-        return jsonify({
-            "error": "Keine gültigen Adressen gefunden.",
-            "invalid_addresses": invalid_addresses
-        }), 400
+  <div class="sidebar">
+    <h2>OSM Routenoptimierer</h2>
 
-    # Gesamtliste (Index 0 = Start/Ziel)
-    coords = [(start_lat, start_lon)] + coords_user
-    geocoded_addresses = [START_ADDRESS] + valid_addresses
+    <div class="start-info">
+      <strong>Start &amp; Ziel (fest):</strong><br>
+      {{ start_address }}
+    </div>
 
-    # OSRM-Matrix abrufen
-    try:
-        distances, durations = get_osrm_table(coords)
-    except Exception as e:
-        return jsonify({"error": f"Fehler bei der OSRM-Matrix: {e}"}), 500
+    <p>
+      <strong>Fester erster Stopp (optional):</strong><br>
+      <input type="text" id="fixedStart" placeholder="Adresse des ersten Kundenstopps">
+      <small>Diese Adresse muss in der Stoppliste stehen und wird als erster Stopp nach dem Depot angefahren.</small>
+    </p>
 
-    n_points = len(coords)
+    <p><strong>Stopps eingeben:</strong><br>
+      Jede Ziel-Adresse in eine <u>eigene Zeile</u> schreiben – ohne Startadresse.<br>
+      Beispiel:<br>
+      <code>Martin-Andersen-Nexö-Ring 12, 18106 Rostock</code><br>
+      <code>Maxim-Gorki-Straße 36, 18106 Rostock</code>
+    </p>
 
-    # Reihenfolge berechnen:
-    # - Bis zu 25 Punkte -> OR-Tools (TSP)
-    # - Darüber -> Greedy-Fallback
-    solver_used = "greedy"
-    order = None
+    <textarea id="addresses" placeholder="Ziel-Adresse 1&#10;Ziel-Adresse 2&#10;..."></textarea>
 
-    if HAS_OR_TOOLS and n_points <= 25:
-        order = ortools_tsp(distances, roundtrip=True)
-        if order is not None:
-            solver_used = "ortools"
+    <div class="file-row">
+      <label for="fileInput"><strong>Adressen importieren:</strong></label><br>
+      <input type="file" id="fileInput" accept=".txt,.csv">
+      <div><small>Die Inhalte der Datei werden ins Textfeld übernommen.</small></div>
+    </div>
 
-    if order is None:
-        order = greedy_tsp(distances, roundtrip=True)
+    <button id="optimizeBtn">Route optimieren</button>
+    <button id="saveCsvBtn" disabled>Tour als CSV speichern</button>
+    <button id="savePdfBtn" disabled>Tour als PDF exportieren</button>
 
-    # Fester erster Kunden-Stopp:
-    # -> Muss in geocoded_addresses vorkommen (Index != 0)
-    fixed_start_idx = None
-    if fixed_start_raw:
-        norm_map = {norm_for_match(addr): idx
-                    for idx, addr in enumerate(geocoded_addresses)}
-        fixed_start_idx = norm_map.get(norm_for_match(fixed_start_raw))
-        if fixed_start_idx == 0:
-            fixed_start_idx = None  # Depot darf nicht als fester Kundenstopp gelten
+    <div id="status" class="result"></div>
+    <div id="stats" class="result"></div>
+    <div id="solverInfo" class="solver-info"></div>
+    <div id="duplicates" class="result"></div>
+    <div id="invalid" class="result"></div>
+    <div id="orderedList" class="result"></div>
+  </div>
 
-    # Sicherstellen, dass Depot (0) am Anfang und Ende steht
-    if 0 not in order:
-        order.insert(0, 0)
-    if order[0] != 0:
-        if 0 in order:
-            order.remove(0)
-        order.insert(0, 0)
-    if order[-1] != 0:
-        if 0 in order:
-            order.remove(0)
-        order.append(0)
+  <div id="map"></div>
 
-    # Fester erster Kunden-Stopp direkt nach Depot
-    if fixed_start_idx is not None and fixed_start_idx in order:
-        # aus aktueller Position entfernen
-        order = [i for i in order if i != fixed_start_idx]
-        # direkt nach Depot einfügen
-        order.insert(1, fixed_start_idx)
+  <!-- Leaflet JS -->
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 
-    # Distanz & Zeit summieren
-    total_distance = 0
-    total_duration = 0
+  <script>
+    let currentTourData = null;
 
-    for i in range(len(order) - 1):
-        a = order[i]
-        b = order[i + 1]
-        total_distance += distances[a][b]
-        total_duration += durations[a][b]
+    // Nummerierte Icons: Start/Ziel in GRÜN, Stopps in BLAU
+    function startIcon(number) {
+      return L.divIcon({
+        html: `
+          <div style="
+            background:#00aa55;
+            color:white;
+            width:32px;
+            height:32px;
+            line-height:32px;
+            text-align:center;
+            border-radius:50%;
+            font-weight:bold;
+            font-size:15px;
+            border:2px solid white;
+            box-shadow:0 0 4px rgba(0,0,0,0.8);
+          ">${number}</div>`,
+        className: "number-icon",
+        iconSize: [32, 32],
+        iconAnchor: [16, 32]
+      });
+    }
 
-    # OSRM-Route holen
-    try:
-        route = get_osrm_route(coords, order)
-    except Exception as e:
-        return jsonify({"error": f"Fehler bei der Routenberechnung: {e}"}), 500
+    function stopIcon(number) {
+      return L.divIcon({
+        html: `
+          <div style="
+            background:#0078ff;
+            color:white;
+            width:32px;
+            height:32px;
+            line-height:32px;
+            text-align:center;
+            border-radius:50%;
+            font-weight:bold;
+            font-size:15px;
+            border:2px solid white;
+            box-shadow:0 0 4px rgba(0,0,0,0.8);
+          ">${number}</div>`,
+        className: "number-icon",
+        iconSize: [32, 32],
+        iconAnchor: [16, 32]
+      });
+    }
 
-    # Ausgabe formatieren
-    ordered_list = []
-    for idx, i in enumerate(order):
-        ordered_list.append({
-            "sequence": idx + 1,
-            "address": geocoded_addresses[i],
-            "lat": coords[i][0],
-            "lon": coords[i][1],
-            "is_start": (i == 0)
+    // Helle, moderne Karte: CartoDB Positron
+    var map = L.map('map').setView([54.1, 12.1], 11); // Rostock
+
+    L.tileLayer(
+      'https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png',
+      {
+        maxZoom: 19,
+        attribution: '&copy; OpenStreetMap-Mitwirkende, &copy; CARTO'
+      }
+    ).addTo(map);
+
+    var routeLayer = null;
+    var markersLayer = L.layerGroup().addTo(map);
+
+    // Datei-Import
+    var fileInput = document.getElementById('fileInput');
+    var textarea = document.getElementById('addresses');
+
+    fileInput.addEventListener('change', function () {
+      var file = fileInput.files[0];
+      if (!file) return;
+
+      var reader = new FileReader();
+      reader.onload = function (e) {
+        var content = e.target.result;
+        var current = textarea.value.trim();
+        textarea.value = current ? (current + "\n" + content.trim()) : content.trim();
+      };
+      reader.readAsText(file, 'utf-8');
+    });
+
+    // Route optimieren
+    document.getElementById('optimizeBtn').addEventListener('click', function () {
+      var addresses = textarea.value;
+      var fixedStart = document.getElementById('fixedStart').value;
+
+      var status = document.getElementById('status');
+      var stats = document.getElementById('stats');
+      var listDiv = document.getElementById('orderedList');
+      var duplicatesDiv = document.getElementById('duplicates');
+      var invalidDiv = document.getElementById('invalid');
+      var solverInfo = document.getElementById('solverInfo');
+      var saveCsvBtn = document.getElementById('saveCsvBtn');
+      var savePdfBtn = document.getElementById('savePdfBtn');
+
+      status.textContent = "Berechne Route...";
+      stats.textContent = "";
+      listDiv.textContent = "";
+      duplicatesDiv.textContent = "";
+      invalidDiv.textContent = "";
+      solverInfo.textContent = "";
+      saveCsvBtn.disabled = true;
+      savePdfBtn.disabled = true;
+      currentTourData = null;
+
+      fetch('/optimize', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          addresses: addresses,
+          fixed_start: fixedStart
         })
+      })
+      .then(res => res.json().then(data => ({ ok: res.ok, data })))
+      .then(obj => {
+        if (!obj.ok) {
+          status.textContent = "Fehler: " + (obj.data.error || "Unbekannter Fehler");
+          if (obj.data.invalid_addresses) {
+            var invHtml = "<strong>Ungültige/ nicht gefundene Adressen:</strong><ul class=\"invalid-list\">";
+            obj.data.invalid_addresses.forEach(function (d) {
+              invHtml += "<li>" + d + "</li>";
+            });
+            invHtml += "</ul>";
+            invalidDiv.innerHTML = invHtml;
+          }
+          return;
+        }
 
-    return jsonify({
-        "start_address": START_ADDRESS,
-        "ordered_stops": ordered_list,
-        "total_distance_km": round(total_distance / 1000, 2),
-        "total_duration_min": round(total_duration / 60, 1),
-        "route_geojson": route["geometry"],
-        "duplicates": duplicates,
-        "invalid_addresses": invalid_addresses,
-        "solver": solver_used
-    })
+        var data = obj.data;
+        currentTourData = data;
+        saveCsvBtn.disabled = false;
+        savePdfBtn.disabled = false;
 
+        status.textContent = "Route erfolgreich berechnet.";
 
-if __name__ == "__main__":
-    app.run(debug=True)
+        stats.innerHTML =
+          "<strong>Gesamt:</strong> " +
+          data.total_distance_km + " km, " +
+          data.total_duration_min + " Minuten";
+
+        // Solver-Info
+        if (data.solver === "ortools") {
+          solverInfo.textContent = "Optimierer: OR-Tools (TSP, bis ca. 25 Punkte)";
+        } else {
+          solverInfo.textContent = "Optimierer: Greedy (Heuristik-Fallback für größere Touren)";
+        }
+
+        // Dubletten anzeigen
+        if (data.duplicates && data.duplicates.length > 0) {
+          var dupHtml = "<strong>Entfernte Dubletten:</strong><ul class=\"duplicates-list\">";
+          data.duplicates.forEach(function (d) {
+            dupHtml += "<li>" + d + "</li>";
+          });
+          dupHtml += "</ul>";
+          duplicatesDiv.innerHTML = dupHtml;
+        }
+
+        // Ungültige Adressen anzeigen
+        if (data.invalid_addresses && data.invalid_addresses.length > 0) {
+          var invHtml = "<strong>Ungültige/ nicht gefundene Adressen:</strong><ul class=\"invalid-list\">";
+          data.invalid_addresses.forEach(function (d) {
+            invHtml += "<li>" + d + "</li>";
+          });
+          invHtml += "</ul>";
+          invalidDiv.innerHTML = invHtml;
+        }
+
+        // Liste anzeigen
+        var html = "<h3>Optimierte Reihenfolge</h3><ol>";
+        data.ordered_stops.forEach(function (stop) {
+          if (stop.is_start) {
+            html += "<li><strong>(Start/Ziel)</strong> " + stop.address + "</li>";
+          } else {
+            html += "<li>" + stop.address + "</li>";
+          }
+        });
+        html += "</ol>";
+        listDiv.innerHTML = html;
+
+        // Karte aktualisieren
+        markersLayer.clearLayers();
+        if (routeLayer) {
+          map.removeLayer(routeLayer);
+        }
+
+        // Route zeichnen
+        var geojson = data.route_geojson;
+        routeLayer = L.geoJSON(geojson).addTo(map);
+        map.fitBounds(routeLayer.getBounds(), { padding: [20, 20] });
+
+        // Marker setzen
+        data.ordered_stops.forEach(function (stop) {
+          var label = stop.sequence + ". ";
+          if (stop.is_start) {
+            label += "(Start/Ziel) ";
+          }
+          label += stop.address;
+
+          var icon = stop.is_start ? startIcon(stop.sequence) : stopIcon(stop.sequence);
+
+          var marker = L.marker(
+            [stop.lat, stop.lon],
+            { icon: icon }
+          ).bindPopup(label);
+
+          markersLayer.addLayer(marker);
+        });
+
+      })
+      .catch(err => {
+        console.error(err);
+        status.textContent = "Fehler bei der Anfrage.";
+      });
+    });
+
+    // CSV-Export
+    document.getElementById('saveCsvBtn').addEventListener('click', function () {
+      if (!currentTourData) {
+        alert("Es ist keine Tour geladen.");
+        return;
+      }
+
+      var lines = [];
+      lines.push("Reihenfolge;Typ;Adresse;Lat;Lon");
+
+      currentTourData.ordered_stops.forEach(function (stop) {
+        var typ = stop.is_start ? "Start/Ziel" : "Stopp";
+        var line = [
+          stop.sequence,
+          typ,
+          '"' + stop.address.replace(/"/g, '""') + '"',
+          stop.lat,
+          stop.lon
+        ].join(";");
+        lines.push(line);
+      });
+
+      var csvContent = lines.join("\r\n");
+      var blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
+
+      var now = new Date();
+      var timestamp = now.toISOString().slice(0,19).replace(/[:T]/g, "-");
+      var fileName = "tour_" + timestamp + ".csv";
+
+      if (navigator.msSaveBlob) {
+        navigator.msSaveBlob(blob, fileName);
+      } else {
+        var link = document.createElement("a");
+        if (link.download !== undefined) {
+          var url = URL.createObjectURL(blob);
+          link.setAttribute("href", url);
+          link.setAttribute("download", fileName);
+          link.style.visibility = "hidden";
+          document.body.appendChild(link);
+          link.click();
+          document.body.removeChild(link);
+        }
+      }
+    });
+
+    // PDF-Export
+    document.getElementById('savePdfBtn').addEventListener('click', function () {
+      if (!currentTourData) {
+        alert("Es ist keine Tour geladen.");
+        return;
+      }
+
+      const { jsPDF } = window.jspdf;
+      const doc = new jsPDF({ unit: "mm", format: "a4" });
+
+      let y = 15;
+      doc.setFontSize(16);
+      doc.text("Tourplan", 10, y);
+      y += 8;
+
+      doc.setFontSize(11);
+      var dateStr = new Date().toLocaleString();
+      doc.text("Erstellt am: " + dateStr, 10, y);
+      y += 6;
+
+      doc.text("Start/Ziel: " + currentTourData.start_address, 10, y);
+      y += 6;
+
+      doc.text(
+        "Gesamt: " +
+        currentTourData.total_distance_km + " km, " +
+        currentTourData.total_duration_min + " Minuten",
+        10, y
+      );
+      y += 8;
+
+      if (currentTourData.solver === "ortools") {
+        doc.text("Optimierer: OR-Tools (TSP, bis ca. 25 Punkte)", 10, y);
+      } else {
+        doc.text("Optimierer: Greedy (Heuristik-Fallback)", 10, y);
+      }
+      y += 8;
+
+      doc.setFontSize(12);
+      doc.text("Stopps:", 10, y);
+      y += 6;
+      doc.setFontSize(10);
+
+      currentTourData.ordered_stops.forEach(function (stop) {
+        var typ = stop.is_start ? "Start/Ziel" : "Stopp";
+        var line = stop.sequence + ". [" + typ + "] " + stop.address;
+
+        if (y > 280) {
+          doc.addPage();
+          y = 15;
+        }
+
+        var splitted = doc.splitTextToSize(line, 180);
+        doc.text(splitted, 10, y);
+        y += 5 + (splitted.length - 1) * 4;
+      });
+
+      var now = new Date();
+      var timestamp = now.toISOString().slice(0,19).replace(/[:T]/g, "-");
+      var fileName = "tour_" + timestamp + ".pdf";
+      doc.save(fileName);
+    });
+  </script>
+
+</body>
+</html>
