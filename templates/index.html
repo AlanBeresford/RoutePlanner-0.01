@@ -133,18 +133,21 @@
     <h2>OSM Routenoptimierer</h2>
 
     <div class="start-info">
-      <strong>Start &amp; Ziel (fest):</strong><br>
+      <strong>Start &amp; Ziel (festes Depot):</strong><br>
       {{ start_address }}
     </div>
 
     <p>
-      <strong>Fester erster Stopp (optional):</strong><br>
+      <strong>Fester erster Stopp (Pflicht):</strong><br>
       <input type="text" id="fixedStart" placeholder="Adresse des ersten Kundenstopps">
-      <small>Diese Adresse muss in der Stoppliste stehen und wird als erster Stopp nach dem Depot angefahren.</small>
+      <small>
+        Diese Adresse wird als erster Stopp nach dem Depot angefahren.
+        Sie muss nicht zwingend in der Stoppliste stehen – falls nicht vorhanden, wird sie automatisch ergänzt.
+      </small>
     </p>
 
     <p><strong>Stopps eingeben:</strong><br>
-      Jede Ziel-Adresse in eine <u>eigene Zeile</u> schreiben – ohne Startadresse.<br>
+      Jede Ziel-Adresse in eine <u>eigene Zeile</u> schreiben – ohne Depot-Adresse.<br>
       Beispiel:<br>
       <code>Martin-Andersen-Nexö-Ring 12, 18106 Rostock</code><br>
       <code>Maxim-Gorki-Straße 36, 18106 Rostock</code>
@@ -257,7 +260,7 @@
     // Route optimieren
     document.getElementById('optimizeBtn').addEventListener('click', function () {
       var addresses = textarea.value;
-      var fixedStart = document.getElementById('fixedStart').value;
+      var fixedStart = document.getElementById('fixedStart').value.trim();
 
       var status = document.getElementById('status');
       var stats = document.getElementById('stats');
@@ -267,6 +270,12 @@
       var solverInfo = document.getElementById('solverInfo');
       var saveCsvBtn = document.getElementById('saveCsvBtn');
       var savePdfBtn = document.getElementById('savePdfBtn');
+
+      // Fester erster Stopp ist Pflicht (Variante C)
+      if (!fixedStart) {
+        status.textContent = "Bitte einen festen ersten Stopp eingeben.";
+        return;
+      }
 
       status.textContent = "Berechne Route...";
       stats.textContent = "";
