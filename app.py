@@ -108,7 +108,7 @@ def get_osrm_table(coords):
 
 
 def greedy_tsp(distance_matrix, roundtrip=True):
-    """Fallback: einfacher Greedy-Algorithmus für TSP-Lösung."""
+    """Einfacher Greedy-Algorithmus für TSP-Lösung (Index 0 = Depot)."""
     n = len(distance_matrix)
     if n == 0:
         return []
@@ -142,7 +142,7 @@ def greedy_tsp(distance_matrix, roundtrip=True):
 
 
 def ortools_tsp(distance_matrix, roundtrip=True):
-    """Echte TSP-Optimierung mit OR-Tools."""
+    """Echte TSP-Optimierung mit OR-Tools (Index 0 = Depot)."""
     if not HAS_OR_TOOLS:
         return None
 
@@ -234,19 +234,28 @@ def optimize():
     addresses_raw = data.get("addresses", "")
     fixed_start_raw = (data.get("fixed_start") or "").strip()
 
+    # Variante C: Fester erster Stopp ist Pflicht
+    if not fixed_start_raw:
+        return jsonify({"error": "Bitte einen festen ersten Stopp angeben."}), 400
+
     # Ziel-Adressen Zeile für Zeile (Rohliste)
     raw_addresses = [a.strip() for a in addresses_raw.split("\n") if a.strip()]
+
+    # Wenn der feste erste Stopp noch nicht in der Liste vorkommt, automatisch hinzufügen
+    norm_fixed = norm_for_match(fixed_start_raw)
+    if all(norm_for_match(a) != norm_fixed for a in raw_addresses):
+        raw_addresses.insert(0, fixed_start_raw)
 
     if len(raw_addresses) < 1:
         return jsonify({"error": "Bitte mindestens eine Ziel-Adresse eingeben."}), 400
 
-    # Dubletten erkennen & entfernen (Case-insensitive)
+    # Dubletten erkennen & entfernen (normalisiert)
     seen = set()
     user_addresses = []
     duplicates = []
 
     for addr in raw_addresses:
-        key = addr.strip().lower()
+        key = norm_for_match(addr)
         if key in seen:
             duplicates.append(addr)
         else:
@@ -281,9 +290,16 @@ def optimize():
             "invalid_addresses": invalid_addresses
         }), 400
 
-    # Gesamtliste (Index 0 = Start/Ziel)
+    # Gesamtliste (Index 0 = Depot, ab 1 = Kunden)
     coords = [(start_lat, start_lon)] + coords_user
     geocoded_addresses = [START_ADDRESS] + valid_addresses
+
+    # Index des festen ersten Stopps suchen (nie 0)
+    norm_map = {norm_for_match(addr): idx for idx, addr in enumerate(geocoded_addresses)}
+    fixed_start_idx = norm_map.get(norm_fixed)
+
+    if fixed_start_idx is None or fixed_start_idx == 0:
+        return jsonify({"error": "Fester erster Stopp konnte nicht eindeutig zugeordnet werden."}), 400
 
     # OSRM-Matrix abrufen
     try:
@@ -293,48 +309,50 @@ def optimize():
 
     n_points = len(coords)
 
-    # Reihenfolge berechnen:
-    # - Bis zu 25 Punkte -> OR-Tools (TSP)
-    # - Darüber -> Greedy-Fallback
-    solver_used = "greedy"
-    order = None
+    # Spezialfall: Nur Depot + 1 Stopp
+    if n_points == 2:
+        order = [0, 1, 0]
+        solver_used = "greedy"
+    else:
+        # Wir bauen ein Teilproblem: fester erster Stopp ist "Depot" im Teilproblem.
+        # Knotenmenge: [fixed_start_idx] + alle anderen Kunden (1..n-1) außer fixed_start_idx
+        sub_nodes = [fixed_start_idx] + [i for i in range(1, n_points) if i != fixed_start_idx]
 
-    if HAS_OR_TOOLS and n_points <= 25:
-        order = ortools_tsp(distances, roundtrip=True)
-        if order is not None:
-            solver_used = "ortools"
+        # Teil-Distanzmatrix aufbauen
+        m = len(sub_nodes)
+        sub_distances = [[0] * m for _ in range(m)]
+        for i in range(m):
+            for j in range(m):
+                sub_distances[i][j] = distances[sub_nodes[i]][sub_nodes[j]]
 
-    if order is None:
-        order = greedy_tsp(distances, roundtrip=True)
+        # TSP nur über das Teilproblem
+        use_ortools = HAS_OR_TOOLS and m <= 25
+        solver_used = "ortools" if use_ortools else "greedy"
 
-    # Fester erster Kunden-Stopp:
-    # -> Muss in geocoded_addresses vorkommen (Index != 0)
-    fixed_start_idx = None
-    if fixed_start_raw:
-        norm_map = {norm_for_match(addr): idx
-                    for idx, addr in enumerate(geocoded_addresses)}
-        fixed_start_idx = norm_map.get(norm_for_match(fixed_start_raw))
-        if fixed_start_idx == 0:
-            fixed_start_idx = None  # Depot darf nicht als fester Kundenstopp gelten
+        if use_ortools:
+            sub_order = ortools_tsp(sub_distances, roundtrip=True)
+            if sub_order is None:
+                solver_used = "greedy"
+                sub_order = greedy_tsp(sub_distances, roundtrip=True)
+        else:
+            sub_order = greedy_tsp(sub_distances, roundtrip=True)
 
-    # Sicherstellen, dass Depot (0) am Anfang und Ende steht
-    if 0 not in order:
-        order.insert(0, 0)
-    if order[0] != 0:
-        if 0 in order:
-            order.remove(0)
-        order.insert(0, 0)
-    if order[-1] != 0:
-        if 0 in order:
-            order.remove(0)
-        order.append(0)
+        # sub_order sind Indizes in sub_nodes; 0 entspricht fixed_start_idx
+        # Wir bauen globale Reihenfolge:
+        global_order = [0]  # Depot zuerst
+        used = set(global_order)
 
-    # Fester erster Kunden-Stopp direkt nach Depot
-    if fixed_start_idx is not None and fixed_start_idx in order:
-        # aus aktueller Position entfernen
-        order = [i for i in order if i != fixed_start_idx]
-        # direkt nach Depot einfügen
-        order.insert(1, fixed_start_idx)
+        for k in sub_order:
+            node = sub_nodes[k]
+            if node not in used:
+                global_order.append(node)
+                used.add(node)
+
+        # Am Ende zurück zum Depot
+        if global_order[-1] != 0:
+            global_order.append(0)
+
+        order = global_order
 
     # Distanz & Zeit summieren
     total_distance = 0
